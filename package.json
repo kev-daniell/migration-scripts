@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "jscodeshift": "^17.1.2"
+  }
+}
