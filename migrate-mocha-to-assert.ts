@@ -1,6 +1,30 @@
 
 import { Transform } from 'jscodeshift';
 
+function ensureLodashImport(j: any, root: any): void {
+  // Check if lodash is already imported
+  const hasLodashImport = root
+    .find(j.ImportDeclaration)
+    .filter(path => 
+      path.node.source.value === 'lodash' ||
+      path.node.source.value === '_'
+    )
+    .length > 0;
+
+  // Add lodash import if not present
+  if (!hasLodashImport) {
+    root
+      .find(j.Program)
+      .get('body', 0)
+      .insertBefore(
+        j.importDeclaration(
+          [j.importDefaultSpecifier(j.identifier('_'))],
+          j.literal('lodash')
+        )
+      );
+  }
+}
+
 const transform: Transform = (file, api) => {
   const j = api.jscodeshift;
   const root = j(file.source);
@@ -14,7 +38,7 @@ const transform: Transform = (file, api) => {
     )
     .remove();
 
-  // Add node:test and node:assert imports if needed
+  // Add test and assert imports if needed
   const hasNodeTest = root
     .find(j.ImportDeclaration)
     .filter(path => path.node.source.value === 'node:test')
@@ -22,8 +46,14 @@ const transform: Transform = (file, api) => {
 
   const hasNodeAssert = root
     .find(j.ImportDeclaration)
-    .filter(path => path.node.source.value === 'node:assert')
+    .filter(path => 
+      path.node.source.value === 'node:assert' ||
+      path.node.source.value === 'assert'
+    )
     .length > 0;
+
+  // Determine if file is in /modules/bitgo directory using relative path
+  const isInBitGoModule = file.path.startsWith('modules/bitgo/') || file.path.includes('/modules/bitgo/');
 
   // Detect which test functions are used in the file
   const usedTestFunctions = new Set(['describe', 'it']);
@@ -65,10 +95,18 @@ const transform: Transform = (file, api) => {
       .find(j.Program)
       .get('body', 0)
       .insertBefore(
-        j.importDeclaration(
-          [j.importDefaultSpecifier(j.identifier('assert'))],
-          j.literal('node:assert')
-        )
+        isInBitGoModule
+          ? j.expressionStatement(
+              j.assignmentExpression(
+                '=',
+                j.identifier('import assert'),
+                j.callExpression(j.identifier('require'), [j.literal('assert')])
+              )
+            )
+          : j.importDeclaration(
+              [j.importDefaultSpecifier(j.identifier('assert'))],
+              j.literal('node:assert')
+            )
       );
   }
 
@@ -130,22 +168,17 @@ const transform: Transform = (file, api) => {
         return true;
       }
 
-      // Handle x.should.equal(y) and x.should.not.equal(y)
+      // Handle x.should.equal(y), x.should.not.equal(y), and x.something.should.be.equal(y)
       if (j.MemberExpression.check(callee.object)) {
-        // Case 1: x.should.equal(y)
-        if (j.Identifier.check(callee.object.property) && 
-            callee.object.property.name === 'should') {
-          return true;
+        let current = callee.object;
+        const chain = [];
+        while (j.MemberExpression.check(current)) {
+          if (j.Identifier.check(current.property)) {
+            chain.unshift(current.property.name);
+          }
+          current = current.object;
         }
-        
-        // Case 2: x.should.not.equal(y)
-        if (j.Identifier.check(callee.object.property) && 
-            callee.object.property.name === 'not' &&
-            j.MemberExpression.check(callee.object.object) &&
-            j.Identifier.check(callee.object.object.property) &&
-            callee.object.object.property.name === 'should') {
-          return true;
-        }
+        return chain.includes('should');
       }
 
       return false;
@@ -159,17 +192,19 @@ const transform: Transform = (file, api) => {
         // For should.equal(x, y) case
         firstArg = path.node.arguments[0];
       } else {
-        // For x.should.equal(y) or x.should.not.equal(y) case
-        if (j.MemberExpression.check(callee.object) && 
-            j.Identifier.check(callee.object.property)) {
-          if (callee.object.property.name === 'should') {
-            // This is the x.should.equal(y) case
-            firstArg = callee.object.object;
-          } else if (callee.object.property.name === 'not') {
-            // This is the x.should.not.equal(y) case
-            firstArg = callee.object.object.object;
-            isNegated = true;
+        // For x.should.equal(y), x.should.not.equal(y), or x.something.should.be.equal(y) case
+        let current = callee.object;
+        while (j.MemberExpression.check(current)) {
+          if (j.Identifier.check(current.property)) {
+            if (current.property.name === 'should') {
+              firstArg = current.object;
+              break;
+            }
+            if (current.property.name === 'not') {
+              isNegated = true;
+            }
           }
+          current = current.object;
         }
       }
 
@@ -177,14 +212,14 @@ const transform: Transform = (file, api) => {
         j.callExpression(
           j.memberExpression(
             j.identifier('assert'), 
-            j.identifier(isNegated ? 'notEqual' : 'equal')
+            j.identifier(isNegated ? 'notStrictEqual' : 'strictEqual')
           ),
           [firstArg, ...path.node.arguments.slice(firstArg === path.node.arguments[0] ? 1 : 0)]
         )
       );
     });
 
-  // Replace should.deepEqual and x.should.deepEqual
+  // Replace should.deepEqual and x.should.deepEqual (including negated versions)
   root
     .find(j.CallExpression)
     .filter(path => {
@@ -198,11 +233,15 @@ const transform: Transform = (file, api) => {
         return true;
       }
 
-      // Handle x.should.deepEqual(y) or x.should.eql(y)
-      if (j.MemberExpression.check(callee.object) &&
-          j.Identifier.check(callee.object.property) &&
-          callee.object.property.name === 'should') {
-        return true;
+      // Handle x.should.deepEqual(y), x.should.eql(y) and their negated versions
+      if (j.MemberExpression.check(callee.object)) {
+        let current = callee.object;
+        while (j.MemberExpression.check(current)) {
+          if (j.Identifier.check(current.property) && current.property.name === 'should') {
+            return true;
+          }
+          current = current.object;
+        }
       }
 
       return false;
@@ -210,31 +249,47 @@ const transform: Transform = (file, api) => {
     .forEach(path => {
       const callee = path.node.callee;
       let firstArg;
+      let isNegated = false;
       
       if (j.Identifier.check(callee.object) && callee.object.name === 'should') {
         // For should.deepEqual(x, y) or should.eql(x, y) case
         firstArg = path.node.arguments[0];
       } else {
-        // For x.should.deepEqual(y) or x.should.eql(y) case
-        firstArg = callee.object.object;
+        // For x.should.deepEqual(y) or x.should.not.deepEqual(y) case
+        let current = callee.object;
+        while (j.MemberExpression.check(current)) {
+          if (j.Identifier.check(current.property)) {
+            if (current.property.name === 'should') {
+              firstArg = current.object;
+              break;
+            }
+            if (current.property.name === 'not') {
+              isNegated = true;
+            }
+          }
+          current = current.object;
+        }
       }
 
       j(path).replaceWith(
         j.callExpression(
-          j.memberExpression(j.identifier('assert'), j.identifier('deepStrictEqual')),
+          j.memberExpression(
+            j.identifier('assert'), 
+            j.identifier(isNegated ? 'notDeepStrictEqual' : 'deepStrictEqual')
+          ),
           [firstArg, ...path.node.arguments.slice(firstArg === path.node.arguments[0] ? 1 : 0)]
         )
       );
     });
 
-  // Replace x.should.be.true() and x.should.be.false() assertions
+  // Replace x.should.be.true(), x.should.be.false(), x.should.be.True(), x.should.be.False() assertions
   root
     .find(j.CallExpression)
     .filter(path => {
       const callee = path.node.callee;
       if (!j.MemberExpression.check(callee)) return false;
       if (!j.Identifier.check(callee.property)) return false;
-      if (!['true', 'false'].includes(callee.property.name)) return false;
+      if (!['true', 'false', 'True', 'False'].includes(callee.property.name)) return false;
 
       // Check for x.should.be.true() or x.should.be.false()
       const object = callee.object;
@@ -249,11 +304,56 @@ const transform: Transform = (file, api) => {
     })
     .forEach(path => {
       const originalValue = path.node.callee.object.object.object;
-      const booleanValue = path.node.callee.property.name === 'true';
+      const booleanValue = path.node.callee.property.name.toLowerCase() === 'true';
       j(path).replaceWith(
         j.callExpression(
           j.memberExpression(j.identifier('assert'), j.identifier('strictEqual')),
           [originalValue, j.literal(booleanValue)]
+        )
+      );
+    });
+
+  // Handle String() assertions
+  root
+    .find(j.CallExpression)
+    .filter(path => {
+      const callee = path.node.callee;
+      if (!j.MemberExpression.check(callee)) return false;
+      if (!j.Identifier.check(callee.property)) return false;
+      if (callee.property.name !== 'String') return false;
+
+      // Check for .be.a.String() pattern
+      let current = callee.object;
+      while (j.MemberExpression.check(current)) {
+        if (j.Identifier.check(current.property)) {
+          if (current.property.name === 'should') return true;
+        }
+        current = current.object;
+      }
+      return false;
+    })
+    .forEach(path => {
+      // Get the original value by walking up until we find .should
+      let current = path.node.callee.object;
+      let originalValue;
+      while (current && j.MemberExpression.check(current)) {
+        if (j.Identifier.check(current.property) && current.property.name === 'should') {
+          originalValue = current.object;
+          break;
+        }
+        current = current.object;
+      }
+
+      j(path).replaceWith(
+        j.callExpression(
+          j.memberExpression(j.identifier('assert'), j.identifier('strictEqual')),
+          [
+            j.unaryExpression(
+              'typeof',
+              originalValue
+            ),
+            j.literal('string')
+          ]
         )
       );
     });
@@ -359,7 +459,17 @@ const transform: Transform = (file, api) => {
           )
         );
       } else if (props.includes('greaterThanOrEqual')) {
-        // x.should.greaterThanOrEqual(y) -> assert.ok(x >= y)
+        // x.should.be.greaterThanOrEqual(y) -> assert.ok(x >= y)
+        // Find the actual value by walking up the chain until we hit 'should'
+        let current = path.node;
+        while (j.MemberExpression.check(current)) {
+          if (j.Identifier.check(current.property) && current.property.name === 'should') {
+            originalValue = current.object;
+            break;
+          }
+          current = current.object;
+        }
+        
         j(path.parent).replaceWith(
           j.callExpression(
             j.memberExpression(j.identifier('assert'), j.identifier('ok')),
@@ -368,6 +478,43 @@ const transform: Transform = (file, api) => {
                 '>=',
                 originalValue,
                 path.parent.node.arguments[0]
+              )
+            ]
+          )
+        );
+      } else if (props.includes('within')) {
+        // x.should.be.within(min, max) -> assert.ok(_.inRange(x, min, max))
+        ensureLodashImport(j, root);
+        // Get the actual value by walking up until we find .should
+        let current = path.node;
+        while (j.MemberExpression.check(current)) {
+          if (j.Identifier.check(current.property) && current.property.name === 'should') {
+            originalValue = current.object;
+            break;
+          }
+          current = current.object;
+        }
+        j(path.parent).replaceWith(
+          j.callExpression(
+            j.memberExpression(j.identifier('assert'), j.identifier('ok')),
+            [
+              j.callExpression(
+                j.memberExpression(j.identifier('_'), j.identifier('inRange')),
+                [originalValue, ...path.parent.node.arguments]
+              )
+            ]
+          )
+        );
+      } else if (props.includes('startWith')) {
+        // x.should.startWith(y) -> assert.ok(_.startsWith(x, y))
+        ensureLodashImport(j, root);
+        j(path.parent).replaceWith(
+          j.callExpression(
+            j.memberExpression(j.identifier('assert'), j.identifier('ok')),
+            [
+              j.callExpression(
+                j.memberExpression(j.identifier('_'), j.identifier('startsWith')),
+                [originalValue, path.parent.node.arguments[0]]
               )
             ]
           )
@@ -386,29 +533,323 @@ const transform: Transform = (file, api) => {
             ]
           )
         );
-      } else if (props.includes('property')) {
-        // x.should.have.property(y) -> assert.ok(Object.prototype.hasOwnProperty.call(x, y))
+      } else if (props.includes('propertyByPath')) {
+        // x.should.have.propertyByPath('a','b').greaterThan(0)
+        // -> assert.ok(_.get(x, ['a','b']) > 0)
+        ensureLodashImport(j, root);
+        const parent = path.parent;
+        const grandParent = parent.parent;
+        
+        if (j.MemberExpression.check(grandParent.node) &&
+            j.Identifier.check(grandParent.node.property) &&
+            grandParent.node.property.name === 'greaterThan') {
+          const greaterThanCall = grandParent.parent;
+          if (j.CallExpression.check(greaterThanCall.node)) {
+            j(greaterThanCall).replaceWith(
+              j.callExpression(
+                j.memberExpression(j.identifier('assert'), j.identifier('ok')),
+                [
+                  j.binaryExpression(
+                    '>',
+                    j.callExpression(
+                      j.memberExpression(j.identifier('_'), j.identifier('get')),
+                      [originalValue, j.arrayExpression(path.parent.node.arguments)]
+                    ),
+                    greaterThanCall.node.arguments[0]
+                  )
+                ]
+              )
+            );
+            return;
+          }
+        }
+        
+        // x.should.have.propertyByPath('a','b') -> assert.ok(_.get(x, ['a','b']))
         j(path.parent).replaceWith(
           j.callExpression(
             j.memberExpression(j.identifier('assert'), j.identifier('ok')),
             [
               j.callExpression(
-                j.memberExpression(
-                  j.memberExpression(
-                    j.memberExpression(
-                      j.identifier('Object'),
-                      j.identifier('prototype')
-                    ),
-                    j.identifier('hasOwnProperty')
-                  ),
-                  j.identifier('call')
-                ),
-                [originalValue, ...path.parent.node.arguments]
+                j.memberExpression(j.identifier('_'), j.identifier('get')),
+                [originalValue, j.arrayExpression(path.parent.node.arguments)]
               )
             ]
           )
         );
+      } else if (props.includes('property')) {
+        // x.should.have.property(y, z) -> assert.strictEqual(x[y], z)
+        const args = path.parent.node.arguments;
+        if (args.length === 2) {
+          j(path.parent).replaceWith(
+            j.callExpression(
+              j.memberExpression(j.identifier('assert'), j.identifier('strictEqual')),
+              [
+                j.memberExpression(originalValue, args[0], true),
+                args[1]
+              ]
+            )
+          );
+        } else {
+          // x.should.have.property(y) -> assert.ok(Object.prototype.hasOwnProperty.call(x, y))
+          j(path.parent).replaceWith(
+            j.callExpression(
+              j.memberExpression(j.identifier('assert'), j.identifier('ok')),
+              [
+                j.callExpression(
+                  j.memberExpression(
+                    j.memberExpression(
+                      j.memberExpression(
+                        j.identifier('Object'),
+                        j.identifier('prototype')
+                      ),
+                      j.identifier('hasOwnProperty')
+                    ),
+                    j.identifier('call')
+                  ),
+                  [originalValue, ...args]
+                )
+              ]
+            )
+          );
+        }
       }
+    });
+
+  // Handle throw assertions
+  root
+    .find(j.CallExpression)
+    .filter(path => {
+      const callee = path.node.callee;
+      if (!j.MemberExpression.check(callee)) return false;
+      if (!j.Identifier.check(callee.property)) return false;
+      if (!['throw', 'throwError'].includes(callee.property.name)) return false;
+
+      // Check for should chain
+      let current = callee.object;
+      while (j.MemberExpression.check(current)) {
+        if (j.Identifier.check(current.property)) {
+          if (current.property.name === 'should') return true;
+        }
+        current = current.object;
+      }
+      return false;
+    })
+    .forEach(path => {
+      // Check for negation
+      let current = path.node.callee.object;
+      let isNegated = false;
+      let originalValue;
+      
+      while (current && j.MemberExpression.check(current)) {
+        if (j.Identifier.check(current.property)) {
+          if (current.property.name === 'not') {
+            isNegated = true;
+          }
+          if (current.property.name === 'should') {
+            originalValue = current.object;
+            break;
+          }
+        }
+        current = current.object;
+      }
+
+      // Get the function to test
+      const fnToTest = originalValue || path.node.callee.object;
+      
+      // Get error message if provided
+      const errorMessage = path.node.arguments[0];
+
+      if (isNegated) {
+        j(path).replaceWith(
+          j.callExpression(
+            j.memberExpression(j.identifier('assert'), j.identifier('doesNotThrow')),
+            errorMessage ? [fnToTest, errorMessage] : [fnToTest]
+          )
+        );
+      } else {
+        j(path).replaceWith(
+          j.callExpression(
+            j.memberExpression(j.identifier('assert'), j.identifier('throws')),
+            errorMessage ? [fnToTest, errorMessage] : [fnToTest]
+          )
+        );
+      }
+    });
+
+  // Replace should(() => ...).throwError() pattern
+  root
+    .find(j.CallExpression)
+    .filter(path => {
+      const callee = path.node.callee;
+      if (!j.MemberExpression.check(callee)) return false;
+      if (!j.Identifier.check(callee.property)) return false;
+      if (callee.property.name !== 'throwError') return false;
+
+      const object = callee.object;
+      if (!j.CallExpression.check(object)) return false;
+      if (!j.Identifier.check(object.callee)) return false;
+      return object.callee.name === 'should';
+    })
+    .forEach(path => {
+      // Get the error message
+      const errorMessage = path.node.arguments[0];
+      
+      // Create new error message with TypeError prefix
+      const newErrorMessage = j.literal(`TypeError: ${errorMessage.value}`);
+      
+      j(path).replaceWith(
+        j.callExpression(
+          j.memberExpression(j.identifier('assert'), j.identifier('throws')),
+          [
+            path.node.callee.object.arguments[0],
+            newErrorMessage
+          ]
+        )
+      );
+    });
+
+  // Replace x.should.have.properties() pattern
+  root
+    .find(j.CallExpression)
+    .filter(path => {
+      const callee = path.node.callee;
+      if (!j.MemberExpression.check(callee)) return false;
+      if (!j.Identifier.check(callee.property)) return false;
+      if (callee.property.name !== 'properties') return false;
+
+      // Navigate up to check for .should.have
+      let current = callee.object;
+      while (j.MemberExpression.check(current)) {
+        if (j.Identifier.check(current.property)) {
+          if (current.property.name === 'should') return true;
+        }
+        current = current.object;
+      }
+      return false;
+    })
+    .forEach(path => {
+      const obj = path.node.callee.object.object.object;
+      const props = path.node.arguments[0];
+
+      // Handle both array and object property lists
+      if (j.ArrayExpression.check(props)) {
+        // For array of strings: ['prop1', 'prop2']
+        const propChecks = props.elements.map(prop => 
+          j.callExpression(
+            j.memberExpression(
+              j.memberExpression(
+                j.memberExpression(j.identifier('Object'), j.identifier('prototype')),
+                j.identifier('hasOwnProperty')
+              ),
+              j.identifier('call')
+            ),
+            [obj, prop]
+          )
+        );
+
+        const combinedCheck = propChecks.reduce((acc, check) => 
+          j.logicalExpression('&&', acc, check)
+        );
+
+        j(path).replaceWith(
+          j.callExpression(
+            j.memberExpression(j.identifier('assert'), j.identifier('ok')),
+            [combinedCheck]
+          )
+        );
+      } else {
+        // For object: { prop1: value1, prop2: value2 }
+        j(path).replaceWith(
+          j.callExpression(
+            j.memberExpression(j.identifier('assert'), j.identifier('deepStrictEqual')),
+            [
+              j.callExpression(
+                j.memberExpression(
+                  j.identifier('Object'),
+                  j.identifier('fromEntries')
+                ),
+                [
+                  j.callExpression(
+                    j.memberExpression(
+                      j.callExpression(
+                        j.memberExpression(j.identifier('Object'), j.identifier('keys')),
+                        [props]
+                      ),
+                      j.identifier('map')
+                    ),
+                    [
+                      j.arrowFunctionExpression(
+                        [j.identifier('key')],
+                        j.arrayExpression([
+                          j.identifier('key'),
+                          j.memberExpression(obj, j.identifier('key'), true)
+                        ])
+                      )
+                    ]
+                  )
+                ]
+              ),
+              props
+            ]
+          )
+        );
+      }
+    });
+
+  // Replace x.should.be.Null pattern
+  root
+    .find(j.MemberExpression, {
+      property: { name: 'Null' }
+    })
+    .filter(path => {
+      // Walk up the chain to find .should
+      let current = path.node;
+      while (current && j.MemberExpression.check(current)) {
+        if (j.Identifier.check(current.property) && current.property.name === 'should') {
+          return true;
+        }
+        current = current.object;
+      }
+      return false;
+    })
+    .forEach(path => {
+      // Get the original value by walking up until we find .should
+      let current = path.node;
+      let originalValue;
+      while (current && j.MemberExpression.check(current)) {
+        if (j.Identifier.check(current.property) && current.property.name === 'should') {
+          originalValue = current.object;
+          break;
+        }
+        current = current.object;
+      }
+
+      // Check for .not in the chain
+      let checkNode = path.node;
+      let isNegated = false;
+      while (checkNode && j.MemberExpression.check(checkNode)) {
+        if (j.Identifier.check(checkNode.property) && checkNode.property.name === 'not') {
+          isNegated = true;
+          break;
+        }
+        checkNode = checkNode.object;
+      }
+
+      // Create the assertion
+      const assertNode = j.callExpression(
+        j.memberExpression(
+          j.identifier('assert'),
+          j.identifier(isNegated ? 'notStrictEqual' : 'strictEqual')
+        ),
+        [originalValue, j.literal(null)]
+      );
+
+      // Replace the entire chain
+      let parent = path;
+      while (parent.parent && j.MemberExpression.check(parent.parent.node)) {
+        parent = parent.parent;
+      }
+      j(parent).replaceWith(assertNode);
     });
 
   // Replace should.exist and should.not.exist
