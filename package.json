@@ -2,7 +2,7 @@
   "name": "migrations",
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test"
+    "test": "npm run build && node --test ./dist/test/*.js"
   },
   "dependencies": {
     "fast-check": "^3.23.2",
